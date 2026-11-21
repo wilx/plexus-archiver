@@ -20,6 +20,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Set;
@@ -363,21 +364,23 @@ class TarHardLinkFailureModeTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void excludedTargetsMustExistBeforeFallback(boolean existing) throws Exception {
+    void excludedTargetsAreCopiedOnlyWhenPresent(boolean existing) throws Exception {
         Path output = output();
         if (existing) {
             Files.writeString(output.resolve("file"), "existing");
         }
-        RefusingTar extractor = new RefusingTar(archive("file", "archived", "alias", "->file"), output);
-        extractor.setFileSelectors(new FileSelector[] {file -> file.getName().equals("alias")});
+        RefusingTar extractor =
+                new RefusingTar(archive("file", "archived", "alias", "->file", "after", "done"), output);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("file")});
+        extractor.extract();
         if (existing) {
-            extractor.extract();
             assertEquals("existing", Files.readString(output.resolve("alias")));
+            assertEquals(1, extractor.attempts);
         } else {
-            assertThrows(ArchiverException.class, extractor::extract);
             assertEquals(0, extractor.attempts);
             assertFalse(Files.exists(output.resolve("alias")));
         }
+        assertEquals("done", Files.readString(output.resolve("after")));
         assertNoStaging(output);
     }
 
@@ -385,16 +388,20 @@ class TarHardLinkFailureModeTest {
     @ValueSource(strings = {"missing", "../outside", "/outside", "alias"})
     void invalidRelationshipsDoNotUseFallback(String target) throws Exception {
         Path output = output();
-        RefusingTar extractor = new RefusingTar(archive("file", "payload", "alias", "->" + target), output);
+        Files.writeString(output.resolve("missing"), "unrelated on-disk file");
+        RefusingTar extractor =
+                new RefusingTar(archive("file", "payload", "alias", "->" + target, "after", "done"), output);
         assertThrows(ArchiverException.class, extractor::extract);
         assertEquals(0, extractor.attempts);
         assertFalse(Files.exists(output.resolve("alias")));
+        assertFalse(Files.exists(output.resolve("after")));
+        assertEquals("unrelated on-disk file", Files.readString(output.resolve("missing")));
         assertNoStaging(output);
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"missing", "directory", "symlink"})
-    void skipsTargetsThatBecomeNonRegular(String kind) throws Exception {
+    void onlyAbsentDeferredTargetsAreSkipped(String kind) throws Exception {
         Path output = output();
         Path outside = Files.writeString(temp.resolve("outside"), "secret");
         if (kind.equals("symlink")) {
@@ -405,7 +412,9 @@ class TarHardLinkFailureModeTest {
             }
         }
         RefusingTar extractor =
-                new RefusingTar(archive("file", "payload", "alias", "->file", "after", "done"), output) {
+                new RefusingTar(
+                        archive("file", "payload", "alias", "->file", "dependent", "->alias", "after", "done"),
+                        output) {
                     @Override
                     protected void onEntryExtracted(Path destination) {
                         super.onEntryExtracted(destination);
@@ -423,8 +432,14 @@ class TarHardLinkFailureModeTest {
                         }
                     }
                 };
-        extractor.extract();
+        if (kind.equals("missing")) {
+            extractor.extract();
+        } else {
+            assertThrows(ArchiverException.class, extractor::extract);
+        }
         assertFalse(Files.exists(output.resolve("alias")));
+        assertFalse(Files.exists(output.resolve("dependent")));
+        assertEquals("done", Files.readString(output.resolve("after")));
         assertEquals("secret", Files.readString(outside));
         assertNoStaging(output);
     }
@@ -460,16 +475,87 @@ class TarHardLinkFailureModeTest {
                     }
                 };
         extractor.setFailOnSymlinkTraversal(kind.equals("inside-strict"));
-        extractor.extract();
         if (kind.equals("inside-default")) {
+            extractor.extract();
             assertEquals("replacement", Files.readString(output.resolve(alias)));
         } else {
+            assertThrows(ArchiverException.class, extractor::extract);
             assertFalse(Files.exists(output.resolve(alias)));
         }
         assertEquals("replacement", Files.readString(other.resolve("file")));
         assertFalse(Files.exists(other.resolve("link")));
         assertNoStaging(output);
         assertNoStaging(other);
+    }
+
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void targetDisappearingDuringLinkCreationIsSkipped(HardLinkFailureMode mode) throws Exception {
+        Path output = output();
+        Files.writeString(output.resolve("alias"), "existing");
+        TarUnArchiver extractor =
+                new TarUnArchiver(archive("file", "payload", "alias", "->file", "after", "done")
+                        .toFile()) {
+                    @Override
+                    protected void createHardLink(Path link, Path existing) throws IOException {
+                        Files.delete(existing);
+                        throw new NoSuchFileException(existing.toString());
+                    }
+                };
+        extractor.setDestDirectory(output.toFile());
+        extractor.setHardLinkFailureMode(mode);
+        extractor.extract();
+        assertEquals("existing", Files.readString(output.resolve("alias")));
+        assertEquals("done", Files.readString(output.resolve("after")));
+        assertNoStaging(output);
+    }
+
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void targetBecomingNonRegularDuringLinkCreationRemainsFatal(HardLinkFailureMode mode) throws Exception {
+        Path output = output();
+        Files.writeString(output.resolve("alias"), "existing");
+        TarUnArchiver extractor =
+                new TarUnArchiver(archive("file", "payload", "alias", "->file", "after", "done")
+                        .toFile()) {
+                    @Override
+                    protected void createHardLink(Path link, Path existing) throws IOException {
+                        Files.delete(existing);
+                        Files.createDirectory(existing);
+                        throw new IOException("Target became a directory");
+                    }
+                };
+        extractor.setDestDirectory(output.toFile());
+        extractor.setHardLinkFailureMode(mode);
+        assertThrows(ArchiverException.class, extractor::extract);
+        assertEquals("existing", Files.readString(output.resolve("alias")));
+        assertFalse(Files.exists(output.resolve("after")));
+        assertNoStaging(output);
+    }
+
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void inaccessibleTargetIsNotTreatedAsAbsent(HardLinkFailureMode mode) throws Exception {
+        Path output = output();
+        assumeTrue(Files.getFileStore(output).supportsFileAttributeView("posix"), "POSIX search permissions required");
+        Path parent = Files.createDirectory(output.resolve("locked"));
+        Files.writeString(parent.resolve("file"), "existing target");
+        Files.writeString(output.resolve("alias"), "existing alias");
+        RefusingTar extractor =
+                new RefusingTar(archive("locked/file", "archived", "alias", "->locked/file", "after", "done"), output);
+        extractor.setHardLinkFailureMode(mode);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("locked/file")});
+        try {
+            Files.setPosixFilePermissions(parent, Set.of());
+            assumeTrue(!Files.isExecutable(parent), "Process bypasses search permissions");
+            assertThrows(ArchiverException.class, extractor::extract);
+            assertEquals(0, extractor.attempts);
+            assertEquals("existing alias", Files.readString(output.resolve("alias")));
+            assertFalse(Files.exists(output.resolve("after")));
+        } finally {
+            Files.setPosixFilePermissions(parent, java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+        }
+        assertNoStaging(output);
     }
 
     @Test

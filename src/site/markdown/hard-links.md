@@ -78,7 +78,7 @@ hard-link members that ends at a data member. The extractor rejects a selected
 member in these conditions:
 
 - The link references a subsequent member.
-- The target member is missing.
+- The target member is missing from the source archive.
 - The link references itself.
 - The target is not a regular file or a hard link to a regular file.
 - The path goes outside the destination directory.
@@ -111,8 +111,13 @@ The extractor uses different records for source archive names and mapped
 destination paths. A hard link uses the regular file at the mapped target path.
 GNU tar and bsdtar do the same. If a selection rule excludes the target, the
 hard link uses the target file in the destination directory. If the overwrite
-policy keeps that file, the hard link also uses it. If that file is missing,
-extraction stops with an error.
+policy keeps that file, the hard link also uses it. If that file is missing and
+is not awaiting a deferred copy, the extractor logs a warning, skips the hard
+link, and continues with later members. Any existing alias output is left
+untouched. This applies in every hard-link failure mode. The skipped entry is
+not retried if its target appears later. GNU tar and bsdtar also continue when the on-disk target is
+missing, but report a final failure; this library logs the omission and can
+return successfully.
 
 The extractor does not read the archive again to get the contents of an excluded
 target. It does not make a destination file for an excluded target.
@@ -137,8 +142,10 @@ for members that are not hard links.
 `hardLinkFailureMode` setting. Its default is `HardLinkFailureMode.COPY_TARGET`.
 When the file system refuses a valid hard link, this mode logs a warning and
 queues a copy of the target after the TAR entry loop completes. Backward chains
-can depend on an earlier queued copy. Source relationships, missing excluded
-targets, and unsafe extraction paths are still validated before fallback.
+can depend on an earlier queued copy. Invalid source relationships, unsafe
+extraction paths, and non-regular targets remain fatal. Missing on-disk targets
+with no pending copy are skipped with a warning without attempting native
+creation or queuing a copy.
 
 The copy reads the target's final on-disk contents, including any replacement
 written by a later archive member. For example, if `file` contains `old`, an
@@ -151,10 +158,11 @@ Fallback honors the overwrite policy. A successful later archive write to an
 alias destination cancels its pending copy; a skipped entry does not. A later
 queued occurrence for the same destination replaces the earlier request. The
 extractor rechecks the destination and target paths when processing the queue.
-Missing or non-regular targets, unsafe or changed destinations, and unresolved
-copy dependencies are skipped with warnings. Each copy is staged beside its
-destination, so a copy failure leaves existing output untouched. Copy and rename
-failures stop extraction, and temporary files are removed.
+Missing on-disk targets and unresolved copy dependencies are skipped with
+warnings. Non-regular targets, unsafe or changed destinations, and other target
+lookup errors remain fatal. Each copy is staged beside its destination, so a
+copy failure leaves existing output untouched. Copy and rename failures stop
+extraction, and temporary files are removed.
 
 To fail immediately when native hard-link creation is refused, use:
 

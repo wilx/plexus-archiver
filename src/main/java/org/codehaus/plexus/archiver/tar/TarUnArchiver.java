@@ -122,7 +122,8 @@ public class TarUnArchiver extends AbstractUnArchiver {
     /**
      * Sets how the filesystem's refusal of a valid hard link is handled.
      * Copy fallback uses the target's final contents and honors the overwrite policy.
-     * Invalid archive relationships and unsafe extraction paths still fail immediately.
+     * Missing on-disk targets are skipped with a warning in every mode.
+     * Invalid archive relationships, unsafe extraction paths and non-regular targets still fail immediately.
      *
      * @param mode how refused hard links are handled
      * @throws NullPointerException if mode is null
@@ -397,7 +398,38 @@ public class TarUnArchiver extends AbstractUnArchiver {
                 output, new DeferredHardLink(directory, entry.getName(), name, targetName, entry.getModTime()));
     }
 
-    /** Links the current mapped target, following the filesystem semantics of command-line tar. */
+    /** Returns false only for confirmed absence; type errors and other lookup failures remain fatal. */
+    private boolean hardLinkTargetExists(Path target, String targetName) throws IOException {
+        BasicFileAttributes attributes;
+        try {
+            attributes = Files.readAttributes(target, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException e) {
+            return false;
+        }
+        if (!attributes.isRegularFile()) {
+            throw new IOException("TAR hard-link target is not a regular file: " + targetName);
+        }
+        return true;
+    }
+
+    private void warnMissingHardLinkTarget(String name, String targetName) {
+        getLogger().warn("Skipping TAR hard link {} -> {}: target does not exist", name, targetName);
+    }
+
+    /** Rechecks mapped containment and final output types before installing or skipping a replacement. */
+    private void checkUnchangedHardLinkPaths(
+            File directory, String name, String targetName, String entryName, Path output, Path target)
+            throws IOException {
+        if (!output.equals(checkedOutput(directory, name, entryName, false))
+                || !target.equals(checkedOutput(directory, targetName, entryName, true))
+                || output.equals(target)
+                || Files.isSymbolicLink(output)
+                || Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("TAR hard-link paths changed during extraction: " + name);
+        }
+    }
+
+    /** Links the current mapped target, skipping confirmed missing on-disk targets with a warning. */
     private void extractHardLink(File directory, TarArchiveEntry entry, String name, String targetName)
             throws IOException {
         Path output = checkedOutput(directory, name, entry.getName(), false);
@@ -411,18 +443,22 @@ public class TarUnArchiver extends AbstractUnArchiver {
         if (!shouldExtractEntry(directory, output.toFile(), name, entry.getModTime())) {
             return;
         }
-        // Excluded or retained targets are not recovered from the archive; their current path must exist.
-        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && !isDeferredTarget(target)) {
-            throw new IOException("TAR hard-link target is not an existing regular file: " + targetName);
+        // Do not recover excluded contents or create an empty alias when the mapped target is absent.
+        if (!hardLinkTargetExists(target, targetName) && !isDeferredTarget(target)) {
+            warnMissingHardLinkTarget(entry.getName(), targetName);
+            return;
         }
         Files.createDirectories(output.getParent());
         output = checkedOutput(directory, name, entry.getName(), false);
         target = checkedOutput(directory, targetName, entry.getName(), true);
         if (output.equals(target)
                 || Files.isSymbolicLink(output)
-                || Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)
-                || (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && !isDeferredTarget(target))) {
+                || Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("TAR hard-link paths changed during extraction: " + name);
+        }
+        if (!hardLinkTargetExists(target, targetName) && !isDeferredTarget(target)) {
+            warnMissingHardLinkTarget(entry.getName(), targetName);
+            return;
         }
         if (isDeferredTarget(target)) {
             deferHardLink(directory, entry, name, targetName, output);
@@ -434,6 +470,11 @@ public class TarUnArchiver extends AbstractUnArchiver {
             try {
                 createHardLink(temporary, target);
             } catch (IOException | UnsupportedOperationException e) {
+                checkUnchangedHardLinkPaths(directory, name, targetName, entry.getName(), output, target);
+                if (!hardLinkTargetExists(target, targetName)) {
+                    warnMissingHardLinkTarget(entry.getName(), targetName);
+                    return;
+                }
                 if (hardLinkFailureMode == HardLinkFailureMode.FAIL) {
                     throw new IOException("Cannot create TAR hard link " + name, e);
                 }
@@ -466,25 +507,15 @@ public class TarUnArchiver extends AbstractUnArchiver {
             for (var pending : new ArrayList<>(deferredHardLinks.entrySet())) {
                 Path output = pending.getKey();
                 DeferredHardLink link = pending.getValue();
-                Path target;
-                try {
-                    Path checked = checkedOutput(link.directory(), link.name(), link.entryName(), false);
-                    target = checkedOutput(link.directory(), link.targetName(), link.entryName(), true);
-                    if (!output.equals(checked)
-                            || output.equals(target)
-                            || Files.isSymbolicLink(output)
-                            || Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)) {
-                        throw new IOException("TAR hard-link destination changed: " + link.name());
-                    }
-                    if (deferredHardLinks.containsKey(target)) {
-                        continue;
-                    }
-                    if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
-                        throw new IOException(
-                                "TAR hard-link target is not an existing regular file: " + link.targetName());
-                    }
-                } catch (IOException | ArchiverException e) {
-                    getLogger().warn("Skipping deferred TAR hard link {}: {}", link.entryName(), e.getMessage());
+                Path target = checkedOutput(link.directory(), link.targetName(), link.entryName(), true);
+                checkUnchangedHardLinkPaths(
+                        link.directory(), link.name(), link.targetName(), link.entryName(), output, target);
+                boolean targetExists = hardLinkTargetExists(target, link.targetName());
+                if (deferredHardLinks.containsKey(target)) {
+                    continue;
+                }
+                if (!targetExists) {
+                    warnMissingHardLinkTarget(link.entryName(), link.targetName());
                     deferredHardLinks.remove(output);
                     progress = true;
                     continue;
@@ -507,16 +538,24 @@ public class TarUnArchiver extends AbstractUnArchiver {
         Path temporary = output.getParent().resolve(".plexus-link-" + UUID.randomUUID());
         try {
             Files.copy(target, temporary, StandardCopyOption.COPY_ATTRIBUTES, LinkOption.NOFOLLOW_LINKS);
-            if (!Files.isRegularFile(temporary, LinkOption.NOFOLLOW_LINKS)
-                    || !Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)
-                    || !output.equals(checkedOutput(link.directory(), link.name(), link.entryName(), false))
-                    || !target.equals(checkedOutput(link.directory(), link.targetName(), link.entryName(), true))
-                    || Files.isSymbolicLink(output)
-                    || Files.isDirectory(output, LinkOption.NOFOLLOW_LINKS)) {
+            checkUnchangedHardLinkPaths(
+                    link.directory(), link.name(), link.targetName(), link.entryName(), output, target);
+            if (!Files.isRegularFile(temporary, LinkOption.NOFOLLOW_LINKS)) {
                 throw new IOException("TAR hard-link paths changed during copying: " + link.name());
+            }
+            if (!hardLinkTargetExists(target, link.targetName())) {
+                warnMissingHardLinkTarget(link.entryName(), link.targetName());
+                return;
             }
             Files.move(temporary, output, StandardCopyOption.REPLACE_EXISTING);
             onEntryExtracted(output);
+        } catch (NoSuchFileException e) {
+            checkUnchangedHardLinkPaths(
+                    link.directory(), link.name(), link.targetName(), link.entryName(), output, target);
+            if (hardLinkTargetExists(target, link.targetName())) {
+                throw e;
+            }
+            warnMissingHardLinkTarget(link.entryName(), link.targetName());
         } finally {
             Files.deleteIfExists(temporary);
         }

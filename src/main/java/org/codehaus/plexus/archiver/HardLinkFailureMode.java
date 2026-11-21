@@ -17,6 +17,7 @@ package org.codehaus.plexus.archiver;
 
 /**
  * What a TAR extractor does when the file system refuses a valid hard link.
+ * Missing on-disk targets are skipped with a warning in every mode.
  *
  * @since 5.0.0
  */
@@ -26,7 +27,8 @@ public enum HardLinkFailureMode {
 
     /**
      * Log a warning and copy the target's final contents after the TAR entries have been extracted.
-     * Queued targets that become invalid or missing and unresolved copy dependencies are skipped with a warning.
+     * Missing on-disk targets and unresolved copy dependencies are skipped with a warning.
+     * Invalid archive relationships, unsafe paths, non-regular targets and other I/O failures remain fatal.
      */
     COPY_TARGET,
 

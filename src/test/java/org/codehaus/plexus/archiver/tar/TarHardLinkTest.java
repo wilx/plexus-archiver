@@ -22,6 +22,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Enumeration;
+import java.util.List;
 
 import org.apache.commons.compress.archivers.ArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
@@ -246,16 +247,90 @@ class TarHardLinkTest {
             file.close();
         }
     }
-    /** A missing excluded target fails without seeking back or creating excluded names. */
-    @Test
-    void rejectsAliasWhenExcludedTargetIsAbsent() throws Exception {
-        Path output = Files.createDirectory(temp.resolve("single"));
-        TarUnArchiver unarchiver = unarchiver(archive(false), output);
-        unarchiver.setFileSelectors(new FileSelector[] {file -> file.getName().equals("link")});
-        assertThrows(org.codehaus.plexus.archiver.ArchiverException.class, unarchiver::extract);
-        try (var files = Files.list(output)) {
-            assertEquals(0, files.count());
+    /** Missing excluded targets and their dependent aliases are skipped without blocking later entries. */
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void skipsAliasesWhenExcludedTargetIsAbsent(HardLinkFailureMode mode) throws Exception {
+        Path source = Files.createTempFile(temp, "selected", ".tar");
+        try (TarArchiveOutputStream out = new TarArchiveOutputStream(Files.newOutputStream(source))) {
+            entry(out, "file", "archive content", null);
+            entry(out, "link", "", "file");
+            entry(out, "another", "", "link");
+            entry(out, "after", "later content", null);
         }
+        Path output = Files.createDirectory(temp.resolve("single"));
+        TarUnArchiver extractor = unarchiver(source, output);
+        extractor.setHardLinkFailureMode(mode);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("file")});
+        extractor.setFileMappers(new FileMapper[] {name -> "mapped/" + name});
+        extractor.extract();
+        assertEquals("later content", Files.readString(output.resolve("mapped/after")));
+        try (var files = Files.list(output.resolve("mapped"))) {
+            assertEquals(
+                    List.of("after"),
+                    files.map(path -> path.getFileName().toString()).toList());
+        }
+    }
+
+    /** Skipping an absent target leaves an existing alias untouched, even when overwrite is enabled. */
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void missingTargetPreservesExistingOutput(HardLinkFailureMode mode) throws Exception {
+        Path source = Files.createTempFile(temp, "selected", ".tar");
+        try (TarArchiveOutputStream out = new TarArchiveOutputStream(Files.newOutputStream(source))) {
+            entry(out, "file", "archive content", null);
+            entry(out, "link", "", "file");
+            entry(out, "after", "later content", null);
+        }
+        Path output = Files.createDirectory(temp.resolve("retained"));
+        Files.writeString(output.resolve("link"), "existing content");
+        TarUnArchiver extractor = unarchiver(source, output);
+        extractor.setHardLinkFailureMode(mode);
+        extractor.setOverwrite(true);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("file")});
+        extractor.extract();
+        assertEquals("existing content", Files.readString(output.resolve("link")));
+        assertEquals("later content", Files.readString(output.resolve("after")));
+        try (var files = Files.list(output)) {
+            assertEquals(
+                    List.of("after", "link"),
+                    files.map(path -> path.getFileName().toString()).sorted().toList());
+        }
+    }
+
+    /** A valid archived target that maps to an on-disk directory remains a fatal type error. */
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void rejectsExcludedTargetThatIsAnExistingDirectory(HardLinkFailureMode mode) throws Exception {
+        Path source = Files.createTempFile(temp, "directory-target", ".tar");
+        try (TarArchiveOutputStream out = new TarArchiveOutputStream(Files.newOutputStream(source))) {
+            entry(out, "file", "archive content", null);
+            entry(out, "link", "", "file");
+            entry(out, "after", "later content", null);
+        }
+        Path output = Files.createDirectory(temp.resolve("directory-output"));
+        Files.createDirectory(output.resolve("file"));
+        Files.writeString(output.resolve("link"), "existing content");
+        TarUnArchiver extractor = unarchiver(source, output);
+        extractor.setHardLinkFailureMode(mode);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("file")});
+        assertThrows(org.codehaus.plexus.archiver.ArchiverException.class, extractor::extract);
+        assertEquals("existing content", Files.readString(output.resolve("link")));
+        assertFalse(Files.exists(output.resolve("after")));
+    }
+
+    /** Missing disk contents must not hide an unsafe mapped target path. */
+    @ParameterizedTest
+    @EnumSource(HardLinkFailureMode.class)
+    void rejectsAbsentTargetOutsideDestination(HardLinkFailureMode mode) throws Exception {
+        Path output = Files.createDirectory(temp.resolve("unsafe-target"));
+        TarUnArchiver extractor = unarchiver(archive(false), output);
+        extractor.setHardLinkFailureMode(mode);
+        extractor.setFileSelectors(new FileSelector[] {file -> !file.getName().equals("file")});
+        extractor.setFileMappers(new FileMapper[] {name -> name.equals("file") ? "../absent" : name});
+        assertThrows(org.codehaus.plexus.archiver.ArchiverException.class, extractor::extract);
+        assertFalse(Files.exists(output.resolve("link")));
+        assertFalse(Files.exists(temp.resolve("absent")));
     }
 
     /** Replacement must unlink an existing inode instead of modifying its other aliases. */
